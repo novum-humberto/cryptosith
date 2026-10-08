@@ -1,0 +1,40 @@
+# Backups y versiones antiguas
+*.bak
+*.bak-*
+*-orig
+*.v0
+*.v1-bak
+*.v1-orig
+*.v1-orig2
+*.v3-bak
+*.v4A-bak
+*.v4-bak
+*.v6-bak
+*.v7-bak
+*.v8-bak
+*.v9-bak
+*.backup-*
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Editores
+.vscode/
+.idea/
+*.sublime-*
+
+# Archivos sensibles
+*.key
+*.pem
+*.gpg
+.env
+.env.*
+secrets/
+
+# Temporales
+*.tmp
+tmp/

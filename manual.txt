@@ -1,0 +1,732 @@
+════════════════════════════════════════════════════════════════════════
+                🧅  CRYPTOSITH — MANUAL DE USUARIO  🧅
+                    Cifrado de archivos y directorios
+════════════════════════════════════════════════════════════════════════
+
+Versión:      v10 (Nivel 4, diseño ortogonal)
+Fecha:        2026-10-06
+Licencia:     Uso personal
+Comando:      cryp  (alias de cryptosith)
+
+────────────────────────────────────────────────────────────────────────
+📖  ÍNDICE
+────────────────────────────────────────────────────────────────────────
+
+  1. QUÉ ES CRYPTOSITH
+  2. INSTALACIÓN
+  3. CONCEPTOS BÁSICOS
+  4. LOS 5 MODOS DE PROTECCIÓN
+  5. TUTORIAL PASO A PASO
+     5.1. Modo single (1 passphrase)
+     5.2. Modo dual (2 passphrases)
+     5.3. Modo TPM-only (solo TPM)
+     5.4. Modo TPM (1 passphrase + TPM)
+     5.5. Modo dual+TPM (máxima seguridad)
+  6. CASOS DE USO PRÁCTICOS
+  7. REFERENCIA DE FLAGS
+  8. FLUJO INTERNO (cómo funciona por dentro)
+  9. RECUPERACIÓN DE DESASTRES
+  10. COMPARATIVA DE SEGURIDAD
+  11. PREGUNTAS FRECUENTES
+
+════════════════════════════════════════════════════════════════════════
+1. QUÉ ES CRYPTOSITH
+════════════════════════════════════════════════════════════════════════
+
+`cryptosith` (alias `cryp`) es una herramienta de cifrado por capas para
+archivos y directorios, escrita en Zsh.
+
+Cifra un archivo o directorio completo aplicando 2 capas:
+
+  Capa 1: Compresión (7z o tar.gz) con exclusiones opcionales.
+  Capa 2: Cifrado age (ChaCha20-Poly1305) con una clave aleatoria.
+
+La clave interna (key1) se protege de 5 formas posibles, según
+combinación de passphrases y TPM.
+
+Resultado: 2-4 archivos (según modo). Todos necesarios.
+
+NO es un reemplazo de restic, borg o kopia. Es una herramienta personal
+para cifrar archivos sueltos o directorios completos, con varios modos
+de protección. Su valor real está en la documentación y en la
+combinación de factores de protección.
+
+Nivel de seguridad real: 8/10 (mínimo) a 9.5/10 (máximo).
+
+════════════════════════════════════════════════════════════════════════
+2. INSTALACIÓN
+════════════════════════════════════════════════════════════════════════
+
+Dependencias obligatorias:
+  - age           (paquete: age)
+  - script        (paquete: util-linux)
+
+Dependencias opcionales:
+  - systemd-creds (systemd)     — solo para modos TPM
+  - gpg           (paquete: gnupg)  — solo retrocompatibilidad v4
+  - 7z            (paquete: p7zip)  — si no usas --tar
+  - tar           (paquete: tar)    — si usas --tar
+  - sha256sum     (paquete: coreutils)  — siempre
+
+Instalación por distribución:
+
+  Arch / Omarchy:
+    sudo pacman -S age util-linux systemd p7zip tar coreutils
+
+  Debian / Ubuntu:
+    sudo apt install age util-linux systemd p7zip-full tar coreutils
+
+  Fedora:
+    sudo dnf install age util-linux systemd p7zip p7zip-plugins tar coreutils
+
+  openSUSE:
+    sudo zypper install age util-linux systemd p7zip tar coreutils
+
+Verificación:
+  which age script systemd-creds gpg 7z tar sha256sum
+
+Instalación de cryptosith:
+
+  1. Copiar la función:
+     nvim ~/.config/zsh/functions/cryptosith
+
+  2. Copiar el autocompletado:
+     nvim ~/.config/zsh/functions/_cryptosith
+
+  3. Registrar el compdef:
+     nvim ~/.config/zsh/conf.d/31-compdefs.zsh
+     → contiene: compdef _cryptosith cryptosith
+
+  4. Añadir al autoload del .zshrc:
+     autoload -Uz ... cryptosith _cryptosith
+
+  5. Añadir el alias:
+     nvim ~/.config/zsh/conf.d/aliases.d/95-func-shortcuts.sh
+     → contiene: alias cryp='cryptosith'
+
+  6. Recargar:
+     exec zsh
+
+  7. Verificar:
+     cryp help
+
+════════════════════════════════════════════════════════════════════════
+3. CONCEPTOS BÁSICOS
+════════════════════════════════════════════════════════════════════════
+
+■ ARCHIVOS GENERADOS
+
+Según el modo, se generan entre 2 y 4 archivos:
+
+  <ruta>.sith          → contenido cifrado (siempre)
+  <ruta>.sith.meta     → metadatos (siempre)
+  <ruta>.sith.key.tpm  → key1 sellada al TPM (solo modos TPM)
+  <ruta>.sith.key.enc  → key1 cifrada con passphrase (TPM + pass)
+  <ruta>.sith.dual     → marcador vacío (modo dual)
+  <ruta>.sith.both     → marcador vacío (modo TPM + pass)
+
+TODOS los archivos son necesarios. Guárdalos juntos.
+
+■ PASSPHRASE MAESTRA
+
+Contraseña que protege la clave interna. Puede ser:
+
+  - Memorizada (baja entropía, riesgo de olvido).
+  - Generada con `cryp key 128` (alta entropía, ~846 bits).
+  - Guardada en gestor de contraseñas (KeePassXC, Bitwarden).
+  - Apuntada en papel (con alfabeto propio, si quieres).
+
+RECOMENDACIÓN: generar con `cryp key 128` y guardar en 2 sitios
+diferentes (gestor + papel, por ejemplo).
+
+■ CLAVE INTERNA (key1)
+
+Clave aleatoria de 128 caracteres que cifra el contenido. NO la ves
+nunca (salvo con --show-keys). Vive dentro del .meta cifrado o sellada
+al TPM.
+
+■ TPM
+
+Trusted Platform Module. Chip en la placa base. Puede "sellar" datos
+de forma que SOLO se puedan recuperar en esa máquina concreta.
+
+Ventaja: rápido, no requiere passphrase.
+Desventaja: si muere la placa o el TPM, adiós datos.
+
+Verificar que el TPM está disponible:
+  ls -la /dev/tpmrm0
+
+Si no existe → el TPM está deshabilitado en BIOS o no hay.
+
+■ age
+
+Herramienta de cifrado moderna. ChaCha20-Poly1305 + scrypt.
+Reemplaza a GPG para cifrado simétrico moderno.
+
+■ AEAD
+
+Authenticated Encryption with Associated Data. Detecta manipulación
+del archivo ANTES de descifrar. ChaCha20-Poly1305 es AEAD.
+
+════════════════════════════════════════════════════════════════════════
+4. LOS 5 MODOS DE PROTECCIÓN
+════════════════════════════════════════════════════════════════════════
+
+Diseño ortogonal: 2 ejes independientes.
+
+  Eje X: nº de passphrases  (0, 1 o 2)
+  Eje Y: TPM                (sí / no)
+
+Combinaciones posibles:
+
+  ┌──────────────────────┬────────┬──────────┬─────────────────────────┐
+  │ Comando              │ Seg.   │ Portable │ Uso típico              │
+  ├──────────────────────┼────────┼──────────┼─────────────────────────┤
+  │ cryp encrypt x       │ 8/10   │ Sí       │ Uso general             │
+  │ cryp encrypt x -d    │ 9/10   │ Sí       │ Archivos importantes    │
+  │ cryp encrypt x -T    │ 9/10   │ NO       │ Solo en este PC         │
+  │ cryp encrypt x -t    │ 9.5/10 │ Sí       │ Rápido + portable       │
+  │ cryp encrypt x -d -t │ 9.5/10 │ Sí       │ MÁXIMA seguridad        │
+  └──────────────────────┴────────┴──────────┴─────────────────────────┘
+
+  (-d = --dual-secret, -t = --tpm, -T = --tpm-only)
+
+■ Modo single (1 passphrase)
+
+  Estructura:
+    .sith           contenido cifrado con key1
+    .sith.meta      key1 cifrada con passphrase
+
+  Descifrar: pide 1 passphrase.
+
+  Uso: cosas del día a día. No es alta seguridad pero es cómodo.
+
+■ Modo dual (2 passphrases)
+
+  Estructura:
+    .sith           contenido cifrado con key1
+    .sith.meta      key1 cifrada con passA → passB
+    .sith.dual      marcador
+
+  Descifrar: pide passA Y passB (ambas, en cualquier orden).
+  Con solo una: imposible.
+
+  Uso: archivos sensibles. Guárdalas en sitios separados.
+
+  Ejemplo de canales separados:
+    PassA → tu cabeza + gestor de contraseñas
+    PassB → papel en caja fuerte / casa de un familiar
+
+  Seguridad: 9/10. Defensa en profundidad real.
+
+■ Modo TPM-only (0 passphrases)
+
+  Estructura:
+    .sith           contenido cifrado con key1
+    .sith.meta      metadatos EN CLARO (sin key1)
+    .sith.key.tpm   key1 sellada al TPM
+
+  Descifrar: sin passphrase. Solo el TPM.
+  Tiene que ser en la misma máquina.
+
+  Uso: cosas muy importantes que quieres rápidas de cifrar/descifrar.
+  NO usar si puede morir la placa.
+
+  Seguridad: 9/10 (pero sin portabilidad).
+
+■ Modo TPM (1 passphrase + TPM)
+
+  Estructura:
+    .sith           contenido cifrado con key1
+    .sith.meta      metadatos EN CLARO
+    .sith.key.tpm   key1 sellada al TPM
+    .sith.key.enc   key1 cifrada con passphrase (fallback)
+    .sith.both      marcador
+
+  Descifrar:
+    - Si TPM disponible → sin passphrase.
+    - Si TPM no disponible → pide passphrase.
+
+  Uso: lo mejor de ambos mundos. Rápido en tu PC, portable en cualquier
+  otra. RECOMENDADO para la mayoría de casos.
+
+  Seguridad: 9.5/10.
+
+■ Modo dual+TPM (2 passphrases + TPM)
+
+  Estructura:
+    .sith           contenido cifrado con key1
+    .sith.meta      metadatos EN CLARO
+    .sith.key.tpm   key1 sellada al TPM
+    .sith.key.enc   key1 cifrada con passA → passB
+    .sith.dual      marcador
+    .sith.both      marcador
+
+  Descifrar:
+    - Si TPM disponible → sin passphrase.
+    - Si TPM no disponible → pide passA Y passB.
+
+  Uso: el octágono completo. La máxima seguridad real sin hardware
+  criptográfico especial (YubiKey).
+
+  Seguridad: 9.5/10 (máximo real).
+
+════════════════════════════════════════════════════════════════════════
+5. TUTORIAL PASO A PASO
+════════════════════════════════════════════════════════════════════════
+
+■ 5.1. Modo single (1 passphrase) — el más simple
+
+  Escenario: cifrar un archivo PDF normal, que quieres subir a Drive.
+
+  Paso 1. Generar una passphrase fuerte:
+
+    $ cryp key 128
+    Kj8vLq2Xp9...  (128 caracteres)
+
+    Cópiala a tu gestor de contraseñas (o apúntala en papel).
+    Bórrala de la terminal si la mostraste.
+
+  Paso 2. Cifrar:
+
+    $ cd ~/Documentos
+    $ cryp encrypt informe.pdf
+
+    🔐 Passphrase maestra (1 passphrase)
+
+      Passphrase: <pega la clave>
+      Repite:     <pega la clave>
+
+    ✓ Cifrado completado (file, modo: single)
+
+      Archivo:   /home/tuuser/Documentos/informe.pdf.sith
+      Metadata:  /home/tuuser/Documentos/informe.pdf.sith.meta
+
+  Paso 3. Subir a Drive:
+
+    $ rclone copy informe.pdf.sith* Drive-Muldorgs:/Backups/
+
+  Paso 4. Cuando lo necesites, descifrar:
+
+    $ cryp decrypt informe.pdf.sith
+
+    🔐 Passphrase
+      Passphrase: <pega la clave>
+
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+      Ruta: /home/tuuser/Documentos/informe.pdf
+
+■ 5.2. Modo dual (2 passphrases) — seguridad real
+
+  Escenario: cifrar tus claves SSH. Muy sensibles.
+
+  Paso 1. Generar DOS passphrases separadas:
+
+    $ cryp key 128 > /tmp/passA.txt
+    $ cat /tmp/passA.txt   # cópiala al gestor de contraseñas
+    $ /bin/rm /tmp/passA.txt
+
+    $ cryp key 128 > /tmp/passB.txt
+    $ cat /tmp/passB.txt   # apúntala en papel, guárdalo en caja fuerte
+    $ /bin/rm /tmp/passB.txt
+
+  Paso 2. Cifrar:
+
+    $ cd ~/.ssh
+    $ cryp encrypt id_rsa --dual-secret --remove
+
+    🔐 MODO DUAL SECRET (2 passphrases en canales separados)
+    ⚠ Guarda cada passphrase en un sitio DISTINTO.
+
+    Passphrase A:
+      Passphrase A: <passA>
+      Repite A:     <passA>
+
+    Passphrase B:
+      Passphrase B: <passB>
+      Repite B:     <passB>
+
+    ✓ Cifrado completado (file, modo: dual)
+    ✓ Original eliminado: /home/tuuser/.ssh/id_rsa
+
+      Archivo:   /home/tuuser/.ssh/id_rsa.sith
+      Metadata:  /home/tuuser/.ssh/id_rsa.sith.meta
+      Marcador:  /home/tuuser/.ssh/id_rsa.sith.dual
+
+  Paso 3. Recuperar cuando lo necesites:
+
+    $ cryp decrypt id_rsa.sith
+
+    🔐 MODO DUAL SECRET
+      Passphrase A: <passA>
+      Passphrase B: <passB>
+
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+      Ruta: /home/tuuser/.ssh/id_rsa
+
+  IMPORTANTE: si pierdes A o B, IRRECUPERABLE.
+
+■ 5.3. Modo TPM-only (solo TPM) — rápido local
+
+  Escenario: cifrar una carpeta de trabajo que solo usas en tu PC.
+
+  Paso 1. Verificar TPM disponible:
+
+    $ ls /dev/tpmrm0
+    /dev/tpmrm0
+
+  Paso 2. Cifrar:
+
+    $ cryp encrypt ~/ProyectoSecreto --tpm-only --exclude node_modules
+
+    🔒 MODO SOLO TPM
+    ⚠ El archivo NO será portable.
+
+    ✓ Cifrado completado (file, modo: tpm+only)
+
+      Archivo:  /home/tuuser/ProyectoSecreto.sith
+      Metadata: /home/tuuser/ProyectoSecreto.sith.meta
+      TPM:      /home/tuuser/ProyectoSecreto.sith.key.tpm
+
+  Paso 3. Descifrar:
+
+    $ cryp decrypt ProyectoSecreto.sith
+    🔒 Desellando key1 del TPM...
+    ✓ key1 desellada del TPM
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+
+  NO PIDE PASSPHRASE. Solo usa el TPM.
+
+  ADVERTENCIA: si muere la placa o el TPM, IRRECUPERABLE.
+
+■ 5.4. Modo TPM (1 passphrase + TPM) — el recomendado
+
+  Escenario: cifrar un backup grande. Rápido en tu PC, recuperable
+  en otra si pasa algo.
+
+  Paso 1. Generar passphrase:
+
+    $ cryp key 128
+    (cópiala al gestor)
+
+  Paso 2. Cifrar:
+
+    $ cryp encrypt ~/backup.tar --tpm
+
+    🔐 Passphrase maestra (1 passphrase)
+    → También se sellará key1 al TPM.
+
+      Passphrase: <clave>
+      Repite:     <clave>
+
+    ✓ Cifrado completado (file, modo: tpm+single)
+
+      Archivo:  /home/tuuser/backup.tar.sith
+      Metadata: /home/tuuser/backup.tar.sith.meta
+      TPM:      /home/tuuser/backup.tar.sith.key.tpm
+      key.enc:  /home/tuuser/backup.tar.sith.key.enc
+      Marcador: /home/tuuser/backup.tar.sith.both
+
+  Paso 3. Descifrar EN TU PC (rápido):
+
+    $ cryp decrypt backup.tar.sith
+    🔒 Desellando key1 del TPM...
+    ✓ key1 desellada del TPM
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+
+    No pide passphrase.
+
+  Paso 4. Descifrar EN OTRO PC (portable):
+
+    Conectar el .sith + .meta + .key.enc (NO el .key.tpm, no sirve).
+    El TPM no está disponible → pide passphrase.
+
+    $ cryp decrypt backup.tar.sith
+    🔐 Passphrase
+      Passphrase: <clave>
+    ✓ key1 descifrada con passphrase
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+
+  LO MEJOR DE AMBOS: rápido donde importa, portable siempre.
+
+■ 5.5. Modo dual+TPM (máxima seguridad) — el octágono completo
+
+  Escenario: cifrar tus claves PGP maestras o un legado digital.
+
+  Paso 1. Generar DOS passphrases:
+
+    $ cryp key 128 > /tmp/passA   # al gestor
+    $ cryp key 128 > /tmp/passB   # al papel
+
+  Paso 2. Cifrar:
+
+    $ cryp encrypt ~/legado.tar --dual-secret --tpm
+
+    🔐 MODO DUAL SECRET (2 passphrases en canales separados)
+    → También se sellará key1 al TPM.
+
+    Passphrase A: <passA>
+    Repite A:     <passA>
+    Passphrase B: <passB>
+    Repite B:     <passB>
+
+    ✓ Cifrado completado (file, modo: tpm+dual)
+
+      Archivo:  /home/tuuser/legado.tar.sith
+      Metadata: /home/tuuser/legado.tar.sith.meta
+      TPM:      /home/tuuser/legado.tar.sith.key.tpm
+      key.enc:  /home/tuuser/legado.tar.sith.key.enc
+      Marcador: /home/tuuser/legado.tar.sith.dual
+      Marcador: /home/tuuser/legado.tar.sith.both
+
+  Paso 3. Descifrar (en tu PC):
+
+    $ cryp decrypt legado.tar.sith
+    🔒 Desellando key1 del TPM...
+    ✓ key1 desellada del TPM
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+
+  Paso 4. Descifrar (en otra PC, sin TPM):
+
+    $ cryp decrypt legado.tar.sith
+    ⚠ key.tpm ausente, intentando fallback a passphrase...
+      Passphrase A: <passA>
+      Passphrase B: <passB>
+    ✓ key1 descifrada con passphrase
+    ✓ Checksum verificado
+    ✓ Descifrado completado
+
+  MÁXIMA SEGURIDAD. El atacante necesita:
+    - El .sith + .meta + .key.enc + .key.tpm (todos).
+    - Y (el TPM de tu PC) O (las 2 passphrases).
+
+════════════════════════════════════════════════════════════════════════
+6. CASOS DE USO PRÁCTICOS
+════════════════════════════════════════════════════════════════════════
+
+■ Backup en Google Drive
+
+  # Cifrar carpeta grande
+  cryp encrypt ~/Proyectos/Web --tpm --exclude node_modules --exclude .git
+  # Subir
+  rclone copy ~/Proyectos/Web.sith* Drive:/Backups/
+
+■ Enviar archivo a un amigo
+
+  # Modo single (portable)
+  cryp encrypt secreto.zip
+  # Mandar .sith + .meta por email (o el que sea)
+  # Mandar passphrase por OTRO canal (Signal, llamada)
+
+■ Guardar claves SSH
+
+  cryp encrypt ~/.ssh/id_ed25519 --dual-secret --remove
+  # PassA al gestor, PassB al papel
+
+■ Cifrado de USB completo
+
+  cryp encrypt /media/usb/backup --tpm --exclude ".Trash-*"
+  # Lleva el USB a casa de un familiar
+
+■ Proyecto diario (rápido)
+
+  # Un alias en tu shell:
+  alias mi-proyecto="cryp encrypt ~/work/proyecto --tpm-only --exclude node_modules --exclude .git --exclude target"
+
+  # Ahora es un comando:
+  mi-proyecto
+
+════════════════════════════════════════════════════════════════════════
+7. REFERENCIA DE FLAGS
+════════════════════════════════════════════════════════════════════════
+
+■ Flags de protección (los 2 ejes):
+
+  -d, --dual-secret      Activa 2 passphrases (en vez de 1).
+  -t, --tpm              Activa TPM (fallback a passphrase si no hay TPM).
+  -T, --tpm-only         Solo TPM, sin passphrase (NO portable).
+
+■ Flags de comportamiento:
+
+  -a, --tar              Usa tar.gz en vez de 7z.
+  -k N, --key-length N   Longitud de key1 (default: 128).
+  -e P, --exclude P      Excluir patrón (repetible).
+  -r, --remove           Borrar la ruta original tras cifrar.
+  -s, --show-keys        Mostrar key1 al terminar.
+  -v, --verbose          Progreso detallado.
+  -h, --help             Ayuda corta.
+
+■ Subcomandos:
+
+  encrypt, enc, e        Cifrar.
+  decrypt, dec, d        Descifrar.
+  key, gen, k            Generar clave aleatoria.
+  man                    Manual completo (este archivo).
+  help, -h, --help       Ayuda corta.
+
+■ Combinaciones válidas (¡todas!):
+
+  cryp encrypt x
+  cryp encrypt x -d
+  cryp encrypt x -t
+  cryp encrypt x -T
+  cryp encrypt x -d -t
+
+  Y con flags extra:
+  cryp encrypt x -d -t -r -v -k 256 -e .git
+  cryp encrypt x -T -a -e node_modules
+
+════════════════════════════════════════════════════════════════════════
+8. FLUJO INTERNO (cómo funciona por dentro)
+════════════════════════════════════════════════════════════════════════
+
+■ Cifrado
+
+  1. Verificar dependencias.
+  2. Detectar tipo (archivo o directorio).
+  3. Pedir passphrase(s) según modo.
+  4. Generar key1 aleatoria (128 chars).
+  5. Comprimir a 7z (o tar.gz) con exclusiones.
+  6. Calcular SHA-256 del comprimido.
+  7. Cifrar el comprimido con age usando key1 → .sith
+  8. Sellar key1 al TPM (si aplica) → .sith.key.tpm
+  9. Cifrar key1 con passphrase(s) → .sith.key.enc o .sith.meta
+  10. Construir .meta (cifrado o claro según modo).
+  11. Escribir marcadores (.dual, .both) si aplica.
+  12. Borrar directorio temporal.
+  13. Borrar original si --remove.
+
+■ Descifrado
+
+  1. Verificar .sith y .meta.
+  2. Detectar modo (existencia de .key.tpm, .dual, .both).
+  3. Intentar desellar key1 del TPM (si aplica y está disponible).
+  4. Si falla, pedir passphrase(s) y descifrar .key.enc.
+  5. Descifrar .sith con key1 → comprimido.
+  6. Verificar SHA-256 del comprimido.
+  7. Extraer 7z (o tar.gz) → contenido original.
+  8. Mover al destino.
+  9. Borrar cifrados si --remove.
+
+■ Verificación de integridad
+
+  El SHA-256 se calcula sobre el COMPRIMIDO (capa 1), no sobre el
+  original. Así refleja exactamente lo que se cifró, incluidas las
+  exclusiones aplicadas.
+
+  Además, age usa ChaCha20-Poly1305 (AEAD), que detecta manipulación
+  del .sith antes de descifrar.
+
+  Doble verificación: SHA-256 + AEAD.
+
+════════════════════════════════════════════════════════════════════════
+9. RECUPERACIÓN DE DESASTRES
+════════════════════════════════════════════════════════════════════════
+
+■ "Perdí la passphrase maestra (modo single)"
+
+  → IRRECUPERABLE. No hay vuelta.
+
+■ "Perdí una de las dos passphrases (modo dual)"
+
+  → IRRECUPERABLE. Necesitas AMBAS.
+
+■ "Muere la placa base (modo TPM-only)"
+
+  → IRRECUPERABLE. La key1 estaba sellada a esa placa concreta.
+
+■ "Muere la placa base (modo TPM o dual+TPM)"
+
+  → RECUPERABLE. Usa la passphrase en otro PC. El .key.enc es portable.
+
+■ "Corrupción del .sith"
+
+  → ChaCha20-Poly1305 lo detecta. Aborta sin descifrar.
+
+■ "Corrupción del contenido tras descifrar"
+
+  → SHA-256 lo detecta. Aborta antes de sobreescribir.
+
+■ "Olvidé cuál modo usé"
+
+  → `cryp decrypt archivo.sith` lo detecta automáticamente.
+  Los marcadores (.dual, .both) y el .key.tpm indican el modo.
+
+■ "Quiero migrar de v4 (GPG) a v9+"
+
+  → Descifrar con cryp (detecta v4 automáticamente).
+  → Volver a cifrar con cryp (usa v9+).
+
+════════════════════════════════════════════════════════════════════════
+10. COMPARATIVA DE SEGURIDAD
+════════════════════════════════════════════════════════════════════════
+
+  Modo            Seguridad   Portable   Velocidad    Comentario
+  ─────────────   ─────────   ────────   ──────────   ──────────────────
+  single          8/10        Sí         Media        Uso general
+  dual            9/10        Sí         Media        Archivos importantes
+  tpm-only        9/10        NO         Rápida       Solo en este PC
+  tpm (1+TPM)     9.5/10      Sí         Rápida       RECOMENDADO
+  dual+tpm        9.5/10      Sí         Rápida       MÁXIMA
+
+  Lo que NO protege (en ningún modo):
+    - Keyloggers activos durante el cifrado/descifrado.
+    - Coacción para dar TODAS las passphrases + acceso al TPM.
+    - Acceso físico a la máquina desbloqueada mientras descifras.
+
+  Para subir de 9.5/10:
+    - Nivel 4 real: YubiKey (~50€) o TPM sellado a PCRs específicos.
+    - Nivel 5: air-gap, Tails OS, auditoría externa.
+    Son procedimientos, no código.
+
+════════════════════════════════════════════════════════════════════════
+11. PREGUNTAS FRECUENTES
+════════════════════════════════════════════════════════════════════════
+
+Q: ¿Puedo cifrar un directorio con subdirectorios?
+A: Sí. `cryp encrypt ~/carpeta` funciona con cualquier nivel de
+   anidamiento. Y con `--exclude` puedes saltarte cosas (node_modules,
+   .git, .venv, target, etc.).
+
+Q: ¿Cuánto ocupa el .sith comparado con el original?
+A: Depende del contenido. Con 7z suele ser MENOR que el original (buena
+   compresión). Con archivos ya comprimidos (jpg, mp4, zip), similar.
+
+Q: ¿Es seguro usar `cryp key 128` para la passphrase?
+A: SÍ. 128 caracteres aleatorios con alfabeto de 98 símbolos = ~846 bits
+   de entropía. Imposible de romper por fuerza bruta.
+
+Q: ¿Qué pasa si ejecuto `cryp decrypt` sin conectar el TPM?
+A: Si el modo tiene fallback a passphrase (tpm, dual+tpm), la pide.
+   Si es tpm-only, IRRECUPERABLE.
+
+Q: ¿Puedo descifrar un .sith creado con v4 (GPG) usando el cryp actual?
+A: Sí. El descifrador detecta la versión en el .meta y usa GPG
+   internamente. Retrocompatibilidad total.
+
+Q: ¿Y si quiero cifrar lo mismo en dos PCs?
+A: Genera la passphrase en uno, cópiala al otro (o usa el .key.enc
+   portátil). Con dual+TPM: las 2 passphrases te permiten descifrar en
+   cualquier PC.
+
+Q: ¿Es production-ready para una empresa?
+A: NO. No está auditada. Es una herramienta personal. Para producción,
+   usa restic, borg o age directamente con auditoría.
+
+════════════════════════════════════════════════════════════════════════
+                            FIN DEL MANUAL
+════════════════════════════════════════════════════════════════════════
+
+Para dudas, revisa el código fuente (~/.config/zsh/functions/cryptosith)
+que está profusamente comentado.
+
+Documentación adicional:
+  - Niveles de seguridad: ver nota Obsidian "cryptosith"
+  - Flags y comportamiento: cryp help
+  - Autocompletado: Tab sobre cryp

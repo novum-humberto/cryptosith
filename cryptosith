@@ -1,0 +1,692 @@
+# cryptosith
+# ================================================================
+# Sistema de cifrado por capas — Nivel 4 (v10).
+#
+# Diseño ORTOGONAL: 2 ejes independientes
+#   Eje X: nº de passphrases (0, 1, 2)
+#   Eje Y: TPM (sí / no)
+#
+# 5 modos resultantes:
+#   cryp encrypt x                          → 1 pass (single, 8/10)
+#   cryp encrypt x -d                       → 2 pass (dual, 9/10)
+#   cryp encrypt x -T                       → 0 pass + TPM (tpm-only, 9/10)
+#   cryp encrypt x -t                       → 1 pass + TPM (tpm, 9.5/10)
+#   cryp encrypt x -d -t                    → 2 pass + TPM (dual+tpm, 9.5/10)
+#
+# Flags cortos soportados (uno a uno, no combinables como -dt):
+#   -d/--dual-secret  -t/--tpm  -T/--tpm-only  -a/--tar
+#   -k/--key-length   -e/--exclude  -r/--remove  -s/--show-keys
+#   -v/--verbose      -h/--help
+#
+# Subcomandos:
+#   encrypt|enc|e   Descifrar
+#   decrypt|dec|d   Descifrar
+#   key|gen|k       Generar clave aleatoria
+#   man             Manual completo (less ~/.config/cryptosith/manual.txt)
+#   help|-h|--help  Ayuda corta
+#
+# Retrocompatible con v4 (GPG), v6, v7, v8, v9.
+#
+# Uso:  cryptosith <subcomando> [opciones]
+# Alias: cryp (en 95-func-shortcuts.sh)
+# ================================================================
+
+cryptosith() {
+    local -r RED='\033[0;31m'
+    local -r GREEN='\033[0;32m'
+    local -r YELLOW='\033[1;33m'
+    local -r BLUE='\033[0;34m'
+    local -r PURPLE='\033[0;35m'
+    local -r CYAN='\033[0;36m'
+    local -r BOLD='\033[1m'
+    local -r NC='\033[0m'
+
+    # ================================================================
+    # AUXILIARES
+    # ================================================================
+    _cryp_info() { echo -e "${CYAN}→ $1${NC}"; }
+    _cryp_ok()   { echo -e "${GREEN}✓ $1${NC}"; }
+    _cryp_warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
+    _cryp_die()  { echo -e "${RED}✗ Error: $1${NC}" >&2; return 1; }
+
+    _cryp_gen_key() {
+        local len="${1:-128}"
+        (( len < 16 )) && len=16
+        local n_upper=$(( len * 26 / 100 ))
+        local n_lower=$(( len * 26 / 100 ))
+        local n_digits=$(( len * 10 / 100 ))
+        local n_symbols=$(( len - n_upper - n_lower - n_digits ))
+        local upper lower digits syms
+        upper=$(LC_ALL=C tr -dc 'A-Z' </dev/urandom | head -c "$n_upper")
+        lower=$(LC_ALL=C tr -dc 'a-z' </dev/urandom | head -c "$n_lower")
+        digits=$(LC_ALL=C tr -dc '0-9' </dev/urandom | head -c "$n_digits")
+        syms=$(LC_ALL=C tr -dc '@#$%&*()_+-=[]{}<>?!;:,.|~^/\ " '"'"'`$' </dev/urandom | head -c "$n_symbols")
+        printf '%s' "$upper$lower$digits$syms" | fold -w1 | shuf | tr -d '\n'
+    }
+
+    _cryp_age_encrypt() {
+        local in="$1" out="$2" pass="$3"
+        local err rc
+        err=$(printf '%s\n%s\n' "$pass" "$pass" \
+            | script -qec "age --passphrase -o '$out' '$in'" /dev/null 2>&1)
+        rc=$?
+        [[ $rc -ne 0 ]] && { echo "$err" | tail -3 >&2; return 1; }
+        return 0
+    }
+
+    _cryp_age_decrypt() {
+        local in="$1" out="$2" pass="$3"
+        local err rc
+        err=$(printf '%s\n' "$pass" \
+            | script -qec "age -d -o '$out' '$in'" /dev/null 2>&1)
+        rc=$?
+        [[ $rc -ne 0 ]] && { echo "$err" | tail -3 >&2; return 1; }
+        return 0
+    }
+
+    _cryp_read_pass() {
+        local prompt="$1" pass
+        printf "  %s" "$prompt" >&2
+        read -rs pass
+        echo "" >&2
+        printf '%s' "$pass"
+    }
+
+    _cryp_tpm_available() {
+        { [[ -e /dev/tpmrm0 ]] || [[ -e /dev/tpm0 ]]; } || return 1
+        command -v systemd-creds >/dev/null 2>&1 || return 1
+        return 0
+    }
+
+    _cryp_tpm_seal() {
+        local in="$1" out="$2" err
+        err=$(systemd-creds encrypt --with-key=tpm2 "$in" "$out" 2>&1)
+        [[ $? -ne 0 ]] && { echo "$err" | tail -3 >&2; return 1; }
+        return 0
+    }
+
+    _cryp_tpm_unseal() {
+        local in="$1" out="$2" err
+        err=$(systemd-creds decrypt --with-key=tpm2 "$in" "$out" 2>&1)
+        [[ $? -ne 0 ]] && { echo "$err" | tail -3 >&2; return 1; }
+        return 0
+    }
+
+    # ================================================================
+    # HELP CORTO
+    # ================================================================
+    _cryp_help() {
+        cat <<'EOF'
+
+🧅 cryptosith (cryp) — Cifrado por capas de archivos y directorios
+
+USO
+  cryp <subcomando> [ruta] [flags]
+
+SUBCOMANDOS
+  encrypt, enc, e     Cifrar archivo o directorio
+  decrypt, dec, d     Descifrar archivo .sith
+  key, gen, k [N]     Generar clave aleatoria de N chars
+  man                 Manual completo en español
+  help, -h, --help    Esta ayuda
+
+MODOS DE PROTECCIÓN (ejes combinables)
+  (sin flags)         1 passphrase            8/10 portátil
+  -d, --dual-secret   2 passphrases           9/10 portátil
+  -T, --tpm-only      Solo TPM                9/10 NO portátil
+  -t, --tpm           1 passphrase + TPM      9.5/10 portátil
+  -d -t               2 passphrases + TPM     9.5/10 portátil (máxima)
+
+OTROS FLAGS
+  -a, --tar           Usa tar.gz (default: 7z)
+  -k, --key-length N  Longitud de key1 (default: 128)
+  -e, --exclude P     Excluir patrón (repetible)
+  -r, --remove        Borrar original tras cifrar
+  -s, --show-keys     Mostrar key1 al terminar
+  -v, --verbose       Progreso detallado
+
+FLAGS NO COMBINABLES COMO -dt (usar -d -t)
+
+EJEMPLOS
+  cryp encrypt doc.pdf                      # simple
+  cryp encrypt doc.pdf -d                   # doble secreto
+  cryp encrypt ~/proyecto -t -e node_modules -e .git
+  cryp encrypt ~/carpeta -d -t -r           # máxima + borrar original
+  cryp decrypt doc.pdf.sith                 # descifrar
+  cryp key 128                              # generar passphrase
+
+MANUAL COMPLETO
+  cryp man    →  tutorial paso a paso de todas las combinaciones
+
+EOF
+    }
+
+    # ================================================================
+    # MAN
+    # ================================================================
+    _cryp_man() {
+        local manual="$HOME/.config/cryptosith/manual.txt"
+        if [[ ! -f "$manual" ]]; then
+            _cryp_die "Manual no encontrado: $manual"
+            _cryp_info "Crea el archivo con el contenido del manual."
+            return 1
+        fi
+        if command -v less >/dev/null 2>&1; then
+            less -R "$manual"
+        else
+            cat "$manual"
+        fi
+    }
+
+    # ================================================================
+    # ENCRYPT
+    # ================================================================
+    _cryp_encrypt() {
+        local file=""
+        local use_tar=false
+        local key_length=128
+        local remove_original=false
+        local show_keys=false
+        local verbose=false
+        local dual_secret=false
+        local use_tpm=false
+        local tpm_only=false
+        local -a excludes=()
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --dual-secret|-d) dual_secret=true; shift ;;
+                --tpm|-t)         use_tpm=true; shift ;;
+                --tpm-only|-T)    use_tpm=true; tpm_only=true; shift ;;
+                --tar|-a)         use_tar=true; shift ;;
+                --key-length|-k)  key_length="$2"; shift 2 ;;
+                --exclude|-e)     excludes+=("$2"); shift 2 ;;
+                --remove|-r)      remove_original=true; shift ;;
+                --show-keys|-s)   show_keys=true; shift ;;
+                --verbose|-v)     verbose=true; shift ;;
+                --algo)
+                    _cryp_warn "age usa siempre ChaCha20-Poly1305. --algo ignorado."
+                    shift 2
+                    ;;
+                -*)               _cryp_die "Flag desconocido: $1"; return 1 ;;
+                *)
+                    if [[ -z "$file" ]]; then file="$1"
+                    else _cryp_die "Solo se permite una ruta"; return 1
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+
+        [[ -z "$file" ]] && { _cryp_die "Falta la ruta"; echo "  Uso: cryp encrypt <archivo|dir> [opciones]"; return 1; }
+        [[ ! -e "$file" ]] && { _cryp_die "No existe: $file"; return 1; }
+        [[ ! -f "$file" && ! -d "$file" ]] && { _cryp_die "No es archivo ni directorio: $file"; return 1; }
+
+        command -v age >/dev/null    || { _cryp_die "age no instalado"; return 1; }
+        command -v script >/dev/null || { _cryp_die "script no instalado"; return 1; }
+
+        local n_pass
+        $tpm_only && n_pass=0 || { $dual_secret && n_pass=2 || n_pass=1; }
+
+        if $use_tpm; then
+            _cryp_tpm_available || { _cryp_die "TPM no disponible o systemd-creds no encontrado"; return 1; }
+        fi
+
+        if ! [[ "$key_length" =~ ^[0-9]+$ ]] || (( key_length < 16 )); then
+            _cryp_die "Longitud de clave inválida (mínimo 16)"
+            return 1
+        fi
+
+        local original_type
+        [[ -f "$file" ]] && original_type="file" || original_type="dir"
+
+        local file_abs; file_abs="$(realpath "$file")"; file_abs="${file_abs%/}"
+        local file_name; file_name="$(basename "$file_abs")"
+        local parent_dir; parent_dir="$(dirname "$file_abs")"
+
+        local out_sith="${file_abs}.sith"
+        local out_meta="${file_abs}.sith.meta"
+        local out_dual="${file_abs}.sith.dual"
+        local out_both="${file_abs}.sith.both"
+        local out_key_tpm="${file_abs}.sith.key.tpm"
+        local out_key_enc="${file_abs}.sith.key.enc"
+
+        [[ -f "$out_sith" ]] && { _cryp_die "Ya existe: $out_sith"; return 1; }
+        [[ -f "$out_meta" ]] && { _cryp_die "Ya existe: $out_meta"; return 1; }
+
+        local tmp_dir; tmp_dir=$(mktemp -d -t cryptosith.XXXXXX) || { _cryp_die "mktemp falló"; return 1; }
+
+        # --- Passphrases ---
+        local passA="" passB=""
+        echo ""
+        if (( n_pass == 0 )); then
+            echo -e "${BOLD}${BLUE}🔒 MODO SOLO TPM${NC}"
+            _cryp_warn "El archivo NO será portable. Solo se descifra en esta máquina."
+        elif (( n_pass == 1 )); then
+            echo -e "${BOLD}${CYAN}🔐 Passphrase maestra${NC} (1 passphrase)"
+            $use_tpm && _cryp_info "También se sellará key1 al TPM."
+            echo ""
+            local p1 p2
+            p1=$(_cryp_read_pass "Passphrase: ")
+            p2=$(_cryp_read_pass "Repite:     ")
+            [[ "$p1" != "$p2" ]] && { rm -rf "$tmp_dir"; _cryp_die "No coinciden"; return 1; }
+            [[ -z "$p1" ]] && { rm -rf "$tmp_dir"; _cryp_die "Vacía"; return 1; }
+            passA="$p1"
+        else
+            echo -e "${BOLD}${PURPLE}🔐 MODO DUAL SECRET${NC} (2 passphrases en canales separados)"
+            $use_tpm && _cryp_info "También se sellará key1 al TPM."
+            _cryp_warn "Guarda cada passphrase en un sitio DISTINTO."
+            echo ""
+            echo -e "${CYAN}Passphrase A${NC}:"
+            local a1 a2
+            a1=$(_cryp_read_pass "Passphrase A: ")
+            a2=$(_cryp_read_pass "Repite A:     ")
+            [[ "$a1" != "$a2" ]] && { rm -rf "$tmp_dir"; _cryp_die "A no coinciden"; return 1; }
+            [[ -z "$a1" ]] && { rm -rf "$tmp_dir"; _cryp_die "A vacía"; return 1; }
+            echo ""
+            echo -e "${CYAN}Passphrase B${NC}:"
+            local b1 b2
+            b1=$(_cryp_read_pass "Passphrase B: ")
+            b2=$(_cryp_read_pass "Repite B:     ")
+            [[ "$b1" != "$b2" ]] && { rm -rf "$tmp_dir"; _cryp_die "B no coinciden"; return 1; }
+            [[ -z "$b1" ]] && { rm -rf "$tmp_dir"; _cryp_die "B vacía"; return 1; }
+            [[ "$a1" == "$b1" ]] && { rm -rf "$tmp_dir"; _cryp_die "A y B idénticas"; return 1; }
+            passA="$a1"; passB="$b1"
+        fi
+
+        $verbose && _cryp_info "Generando key1 aleatoria de $key_length caracteres..."
+        local key1; key1=$(_cryp_gen_key "$key_length")
+
+        # --- Capa 1: Compresión ---
+        local container archive
+        if $use_tar; then
+            container="tar.gz"
+            archive="$tmp_dir/${file_name}.tar.gz"
+            $verbose && _cryp_info "Capa 1/2: tar.gz..."
+            local -a tar_ex=()
+            for ex in "${excludes[@]}"; do tar_ex+=("--exclude=$ex"); done
+            ( cd "$parent_dir" || exit 1; tar -czf "$archive" "${tar_ex[@]}" "$file_name" ) || {
+                rm -rf "$tmp_dir"; _cryp_die "Fallo tar.gz"; return 1; }
+        else
+            container="7z"
+            command -v 7z >/dev/null || { rm -rf "$tmp_dir"; _cryp_die "7z no instalado"; return 1; }
+            archive="$tmp_dir/${file_name}.7z"
+            $verbose && _cryp_info "Capa 1/2: 7z..."
+            local -a sz_ex=()
+            for ex in "${excludes[@]}"; do sz_ex+=("-xr!$ex"); done
+            ( cd "$parent_dir" || exit 1; 7z a -mx=9 "${sz_ex[@]}" "$archive" "$file_name" ) >/dev/null || {
+                rm -rf "$tmp_dir"; _cryp_die "Fallo 7z"; return 1; }
+        fi
+
+        local sha_content; sha_content=$(sha256sum "$archive" | awk '{print $1}')
+
+        # --- Capa 2: age con key1 ---
+        $verbose && _cryp_info "Capa 2/2: age (ChaCha20-Poly1305)..."
+        local encrypted="$tmp_dir/${file_name}.sith"
+        _cryp_age_encrypt "$archive" "$encrypted" "$key1" || {
+            rm -rf "$tmp_dir"; _cryp_die "Fallo age"; return 1; }
+
+        mv "$encrypted" "$out_sith" || { rm -rf "$tmp_dir"; _cryp_die "Fallo mover"; return 1; }
+
+        # --- TPM: sellar key1 ---
+        if $use_tpm; then
+            $verbose && _cryp_info "Sellando key1 al TPM..."
+            local kf="$tmp_dir/key1.txt"; printf '%s' "$key1" > "$kf"
+            _cryp_tpm_seal "$kf" "$out_key_tpm" || {
+                rm -f "$out_sith" "$out_key_tpm"; rm -rf "$tmp_dir"
+                _cryp_die "Fallo sellado TPM"; return 1; }
+        fi
+
+        # --- key1 cifrada con passphrase (fallback portable) ---
+        if $use_tpm && (( n_pass >= 1 )); then
+            $verbose && _cryp_info "Cifrando key1 con passphrase (fallback portable)..."
+            local kf2="$tmp_dir/key1b.txt"; printf '%s' "$key1" > "$kf2"
+            if (( n_pass == 1 )); then
+                _cryp_age_encrypt "$kf2" "$out_key_enc" "$passA" || {
+                    rm -f "$out_sith" "$out_meta" "$out_key_tpm" "$out_key_enc"
+                    rm -rf "$tmp_dir"; _cryp_die "Fallo key.enc"; return 1; }
+            else
+                local kenc_A="$tmp_dir/key.enc.A"
+                _cryp_age_encrypt "$kf2" "$kenc_A" "$passA" || {
+                    rm -f "$out_sith" "$out_meta" "$out_key_tpm" "$out_key_enc"
+                    rm -rf "$tmp_dir"; _cryp_die "Fallo key.enc A"; return 1; }
+                _cryp_age_encrypt "$kenc_A" "$out_key_enc" "$passB" || {
+                    rm -f "$out_sith" "$out_meta" "$out_key_tpm" "$out_key_enc"
+                    rm -rf "$tmp_dir"; _cryp_die "Fallo key.enc B"; return 1; }
+            fi
+        fi
+
+        # --- Construir .meta ---
+        local meta_plain="$tmp_dir/meta.txt"
+        if $use_tpm; then
+            cat > "$meta_plain" <<EOF
+version=10
+original_name=$file_name
+original_type=$original_type
+content_sha256=$sha_content
+cipher1=age-ChaCha20-Poly1305
+container=$container
+protection=$( (( n_pass == 0 )) && echo "tpm-only" || { (( n_pass == 1 )) && echo "tpm+single" || echo "tpm+dual"; } )
+n_pass=$n_pass
+timestamp=$(date -Iseconds)
+EOF
+            cp "$meta_plain" "$out_meta"
+            (( n_pass >= 1 )) && touch "$out_both"
+            (( n_pass == 2 )) && touch "$out_dual"
+        else
+            cat > "$meta_plain" <<EOF
+version=10
+original_name=$file_name
+original_type=$original_type
+content_sha256=$sha_content
+cipher1=age-ChaCha20-Poly1305
+key1=$key1
+container=$container
+protection=$( (( n_pass == 1 )) && echo "single" || echo "dual" )
+n_pass=$n_pass
+timestamp=$(date -Iseconds)
+EOF
+            if (( n_pass == 1 )); then
+                _cryp_age_encrypt "$meta_plain" "$out_meta" "$passA" || {
+                    rm -f "$out_sith" "$out_meta"; rm -rf "$tmp_dir"
+                    _cryp_die "Fallo .meta"; return 1; }
+            else
+                local meta_A="$tmp_dir/meta.A"
+                _cryp_age_encrypt "$meta_plain" "$meta_A" "$passA" || {
+                    rm -f "$out_sith" "$out_meta"; rm -rf "$tmp_dir"
+                    _cryp_die "Fallo .meta A"; return 1; }
+                _cryp_age_encrypt "$meta_A" "$out_meta" "$passB" || {
+                    rm -f "$out_sith" "$out_meta"; rm -rf "$tmp_dir"
+                    _cryp_die "Fallo .meta B"; return 1; }
+                touch "$out_dual"
+            fi
+        fi
+
+        rm -rf "$tmp_dir"
+
+        if $remove_original; then
+            [[ "$original_type" = "dir" ]] && command rm -rf "$file_abs" || command rm -f "$file_abs"
+            _cryp_ok "Original eliminado: $file_abs"
+        fi
+
+        # --- Resumen ---
+        local modo_str
+        if $use_tpm; then
+            modo_str="tpm+$( (( n_pass == 0 )) && echo "only" || { (( n_pass == 1 )) && echo "single" || echo "dual"; } )"
+        else
+            modo_str=$( (( n_pass == 1 )) && echo "single" || echo "dual" )
+        fi
+
+        echo ""
+        _cryp_ok "Cifrado completado ($original_type, modo: $modo_str)"
+        echo ""
+        echo -e "  ${GREEN}Archivo:${NC}   $out_sith"
+        echo -e "  ${GREEN}Metadata:${NC}  $out_meta"
+        [[ -f "$out_key_tpm" ]] && echo -e "  ${GREEN}TPM:${NC}       $out_key_tpm"
+        [[ -f "$out_key_enc" ]] && echo -e "  ${GREEN}key.enc:${NC}   $out_key_enc"
+        [[ -f "$out_dual" ]] && echo -e "  ${GREEN}Marcador:${NC}  $out_dual"
+        [[ -f "$out_both" ]] && echo -e "  ${GREEN}Marcador:${NC}  $out_both"
+        echo ""
+        echo -e "${YELLOW}⚠ IMPORTANTE:${NC}"
+        echo "  • Guarda TODOS los archivos juntos."
+        case "$modo_str" in
+            single)     echo "  • Recuerda la passphrase." ;;
+            dual)       echo "  • Recuerda AMBAS passphrases. Guárdalas en SITIOS DIFERENTES." ;;
+            tpm+only)   echo "  • SOLO se descifra en esta máquina (sin TPM, irrecuperable)." ;;
+            tpm+single) echo "  • Recuerda la passphrase (para portabilidad)." ;;
+            tpm+dual)   echo "  • Recuerda AMBAS passphrases (para portabilidad)." ;;
+        esac
+
+        if $show_keys; then
+            echo ""
+            echo -e "${YELLOW}⚠ Clave interna key1 (backup en papel):${NC}"
+            echo "  $key1"
+            echo -e "${RED}⚠ Con key1 + .sith descifras sin passphrase. Guárdala aparte.${NC}"
+        fi
+
+        return 0
+    }
+
+    # ================================================================
+    # DECRYPT
+    # ================================================================
+    _cryp_decrypt() {
+        local file=""
+        local remove_cipher=false
+        local verbose=false
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --remove|-r)  remove_cipher=true; shift ;;
+                --verbose|-v) verbose=true; shift ;;
+                -*)           _cryp_die "Flag desconocido: $1"; return 1 ;;
+                *)
+                    if [[ -z "$file" ]]; then file="$1"
+                    else _cryp_die "Solo un archivo"; return 1
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+
+        [[ -z "$file" ]] && { _cryp_die "Falta el archivo .sith"; return 1; }
+        [[ ! -f "$file" ]] && { _cryp_die "No existe: $file"; return 1; }
+
+        local file_abs; file_abs="$(realpath "$file")"
+        local meta_file="${file_abs}.meta"
+        local dual_marker="${file_abs}.dual"
+        local both_marker="${file_abs}.both"
+        local key_tpm="${file_abs}.key.tpm"
+        local key_enc="${file_abs}.key.enc"
+
+        [[ ! -f "$meta_file" ]] && { _cryp_die "Falta el .meta"; return 1; }
+
+        local tmp_dir; tmp_dir=$(mktemp -d -t cryptosith.XXXXXX) || { _cryp_die "mktemp falló"; return 1; }
+        local meta_plain="$tmp_dir/meta.txt"
+        local key1=""
+        local meta_ok=false
+        local meta_format=""
+
+        local tpm_used=false
+        local tpm_available=false
+        _cryp_tpm_available && tpm_available=true
+
+        if [[ -f "$key_tpm" ]] && $tpm_available; then
+            echo ""
+            echo -e "${BOLD}${BLUE}🔒 Desellando key1 del TPM...${NC}"
+            local kf="$tmp_dir/key1.txt"
+            if _cryp_tpm_unseal "$key_tpm" "$kf" 2>/dev/null; then
+                key1=$(cat "$kf")
+                _cryp_ok "key1 desellada del TPM"
+                cp "$meta_file" "$meta_plain"
+                meta_ok=true
+                meta_format="tpm (meta claro)"
+                tpm_used=true
+            else
+                _cryp_warn "No se pudo desellar del TPM"
+            fi
+        elif [[ ! -f "$key_tpm" ]] && [[ -f "$key_enc" ]] && $tpm_available; then
+            _cryp_warn "key.tpm ausente, intentando fallback a passphrase..."
+        elif [[ -f "$key_tpm" ]] && ! $tpm_available; then
+            _cryp_warn "TPM no disponible, intentando fallback a passphrase..."
+        fi
+
+        if ! $tpm_used; then
+            local meta_head
+            meta_head=$(head -1 "$meta_file" 2>/dev/null)
+            if [[ "$meta_head" == version=* ]]; then
+                cp "$meta_file" "$meta_plain"
+                meta_ok=true
+                meta_format="tpm (meta claro, sin desellar)"
+                if [[ -f "$key_enc" ]]; then
+                    if [[ -f "$dual_marker" ]]; then
+                        local pA pB
+                        pA=$(_cryp_read_pass "Passphrase A: ")
+                        pB=$(_cryp_read_pass "Passphrase B: ")
+                        local meta_B="$tmp_dir/key.B"
+                        _cryp_age_decrypt "$key_enc" "$meta_B" "$pB" 2>/dev/null || {
+                            rm -rf "$tmp_dir"; _cryp_die "Passphrase B incorrecta"; return 1; }
+                        local kf2="$tmp_dir/key1.txt"
+                        _cryp_age_decrypt "$meta_B" "$kf2" "$pA" 2>/dev/null || {
+                            rm -rf "$tmp_dir"; _cryp_die "Passphrase A incorrecta"; return 1; }
+                        key1=$(cat "$kf2")
+                    else
+                        local pA
+                        pA=$(_cryp_read_pass "Passphrase: ")
+                        local kf2="$tmp_dir/key1.txt"
+                        _cryp_age_decrypt "$key_enc" "$kf2" "$pA" 2>/dev/null || {
+                            rm -rf "$tmp_dir"; _cryp_die "Passphrase incorrecta"; return 1; }
+                        key1=$(cat "$kf2")
+                    fi
+                    _cryp_ok "key1 descifrada con passphrase"
+                else
+                    rm -rf "$tmp_dir"
+                    _cryp_die "Modo TPM sin fallback y sin TPM → irrecuperable"
+                    return 1
+                fi
+            else
+                if [[ -f "$dual_marker" ]]; then
+                    echo ""
+                    echo -e "${BOLD}${PURPLE}🔐 MODO DUAL SECRET${NC}"
+                    local pA pB
+                    pA=$(_cryp_read_pass "Passphrase A: ")
+                    pB=$(_cryp_read_pass "Passphrase B: ")
+                    local meta_B="$tmp_dir/meta.B"
+                    _cryp_age_decrypt "$meta_file" "$meta_B" "$pB" 2>/dev/null || {
+                        rm -rf "$tmp_dir"; _cryp_die "Passphrase B incorrecta"; return 1; }
+                    _cryp_age_decrypt "$meta_B" "$meta_plain" "$pA" 2>/dev/null || {
+                        rm -rf "$tmp_dir"; _cryp_die "Passphrase A incorrecta"; return 1; }
+                    meta_ok=true
+                    meta_format="age dual"
+                else
+                    echo ""
+                    echo -e "${BOLD}${CYAN}🔐 Passphrase${NC}"
+                    local p
+                    p=$(_cryp_read_pass "Passphrase: ")
+                    if command -v age >/dev/null 2>&1 && _cryp_age_decrypt "$meta_file" "$meta_plain" "$p" 2>/dev/null; then
+                        meta_ok=true
+                        meta_format="age single"
+                    elif gpg --batch --quiet --yes --passphrase-fd 3 -d -o "$meta_plain" "$meta_file" 3<<<"$p" 2>/dev/null; then
+                        meta_ok=true
+                        meta_format="gpg (v4)"
+                    else
+                        rm -rf "$tmp_dir"; _cryp_die "Passphrase incorrecta"; return 1
+                    fi
+                fi
+            fi
+        fi
+
+        $meta_ok || { rm -rf "$tmp_dir"; _cryp_die "No se pudo obtener metadata"; return 1; }
+
+        local version="" orig_name="" orig_type="file" orig_sha="" container="" n_pass=""
+        local line k v
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            k="${line%%=*}"; v="${line#*=}"
+            case "$k" in
+                version)                        version="$v" ;;
+                original_name)                  orig_name="$v" ;;
+                original_type)                  orig_type="$v" ;;
+                original_sha256|content_sha256) orig_sha="$v" ;;
+                key1)                           [[ -z "$key1" ]] && key1="$v" ;;
+                container)                      container="$v" ;;
+                n_pass)                         n_pass="$v" ;;
+            esac
+        done < "$meta_plain"
+
+        [[ -z "$orig_name" ]] && { rm -rf "$tmp_dir"; _cryp_die "Falta original_name"; return 1; }
+        [[ -z "$key1" ]] && { rm -rf "$tmp_dir"; _cryp_die "No se obtuvo key1"; return 1; }
+
+        $verbose && _cryp_info "v$version | formato: $meta_format"
+        $verbose && _cryp_info "Original: $orig_name ($orig_type) | Contenedor: $container"
+
+        $verbose && _cryp_info "Descifrando contenido..."
+        local archive="$tmp_dir/archive"
+        local ok=false
+        if [[ "$version" -ge 6 ]]; then
+            _cryp_age_decrypt "$file_abs" "$archive" "$key1" 2>/dev/null && ok=true
+        else
+            gpg --batch --quiet --yes --passphrase-fd 3 -d -o "$archive" "$file_abs" 3<<<"$key1" 2>/dev/null && ok=true
+        fi
+        $ok || { rm -rf "$tmp_dir"; _cryp_die "Fallo al descifrar .sith"; return 1; }
+
+        local sha_now; sha_now=$(sha256sum "$archive" | awk '{print $1}')
+        [[ "$sha_now" != "$orig_sha" ]] && { rm -rf "$tmp_dir"; _cryp_die "Checksum no coincide"; return 1; }
+        _cryp_ok "Checksum verificado"
+
+        local ex_dir="$tmp_dir/extract"; mkdir -p "$ex_dir"
+        if [[ "$container" = "7z" ]]; then
+            7z x -o"$ex_dir" "$archive" >/dev/null || { rm -rf "$tmp_dir"; _cryp_die "Fallo 7z"; return 1; }
+        else
+            tar -xzf "$archive" -C "$ex_dir" || { rm -rf "$tmp_dir"; _cryp_die "Fallo tar.gz"; return 1; }
+        fi
+
+        local extracted="$ex_dir/$orig_name"
+        if [[ ! -e "$extracted" ]]; then
+            if [[ "$orig_type" = "dir" ]]; then
+                extracted=$(find "$ex_dir" -mindepth 1 -maxdepth 1 -type d -name "$orig_name" | head -n1)
+            else
+                extracted=$(find "$ex_dir" -type f -name "$orig_name" | head -n1)
+            fi
+        fi
+        [[ -z "$extracted" || ! -e "$extracted" ]] && { rm -rf "$tmp_dir"; _cryp_die "No se encontró '$orig_name'"; return 1; }
+
+        local out_dir; out_dir="$(dirname "$file_abs")"
+        local final_path="$out_dir/$orig_name"
+        if [[ -e "$final_path" ]]; then
+            _cryp_warn "Ya existe: $final_path"
+            printf "  ¿Sobrescribir? (s/N): "
+            local r; read -r r
+            [[ ! "$r" =~ ^[sSyY]$ ]] && { rm -rf "$tmp_dir"; _cryp_die "Cancelado"; return 1; }
+            [[ -d "$final_path" ]] && rm -rf "$final_path" || rm -f "$final_path"
+        fi
+        mv "$extracted" "$final_path" || { rm -rf "$tmp_dir"; _cryp_die "Fallo mover"; return 1; }
+        rm -rf "$tmp_dir"
+
+        echo ""
+        _cryp_ok "Descifrado completado"
+        echo -e "  ${GREEN}Ruta:${NC} $final_path"
+
+        if $remove_cipher; then
+            command rm -f "$file_abs" "$meta_file"
+            [[ -f "$dual_marker" ]] && command rm -f "$dual_marker"
+            [[ -f "$both_marker" ]] && command rm -f "$both_marker"
+            [[ -f "$key_tpm" ]] && command rm -f "$key_tpm"
+            [[ -f "$key_enc" ]] && command rm -f "$key_enc"
+            _cryp_ok "Archivos cifrados eliminados"
+        fi
+
+        return 0
+    }
+
+    # ================================================================
+    # KEY
+    # ================================================================
+    _cryp_key() {
+        local len="${1:-128}"
+        if ! [[ "$len" =~ ^[0-9]+$ ]] || (( len < 16 )); then
+            _cryp_die "Longitud inválida (mínimo 16)"; return 1
+        fi
+        _cryp_gen_key "$len"
+    }
+
+    # ================================================================
+    # DISPATCHER
+    # ================================================================
+    local cmd="${1:-help}"
+    [[ $# -gt 0 ]] && shift
+
+    case "$cmd" in
+        encrypt|enc|e)     _cryp_encrypt "$@" ;;
+        decrypt|dec|d)     _cryp_decrypt "$@" ;;
+        key|gen|k)         _cryp_key "$@" ;;
+        man)               _cryp_man ;;
+        help|-h|--help)    _cryp_help ;;
+        *)
+            _cryp_die "Comando desconocido: $cmd"
+            echo ""
+            _cryp_help
+            return 1
+            ;;
+    esac
+}

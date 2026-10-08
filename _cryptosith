@@ -1,0 +1,55 @@
+#compdef cryptosith
+
+# ================================================================
+# Autocompletado para cryptosith (cryp).
+# Soporta subcomandos, flags cortos, flags largos y rutas.
+# ================================================================
+
+_cryptosith() {
+    local state
+
+    _arguments -C \
+        '1: :->subcmd' \
+        '*:: :->args' && ret=0
+
+    case "$state" in
+        subcmd)
+            _values 'comandos de cryptosith' \
+                'encrypt[Cifra un archivo o directorio]' \
+                'decrypt[Descifra un archivo .sith]' \
+                'key[Genera una clave aleatoria]' \
+                'man[Manual completo en español]' \
+                'help[Muestra la ayuda corta]'
+            ;;
+        args)
+            case "$words[1]" in
+                encrypt|enc|e)
+                    _arguments \
+                        '(-d --dual-secret)'{-d,--dual-secret}'[2 passphrases en canales separados]' \
+                        '(-t --tpm)'{-t,--tpm}'[1 passphrase + TPM]' \
+                        '(-T --tpm-only)'{-T,--tpm-only}'[Solo TPM (no portable)]' \
+                        '(-a --tar)'{-a,--tar}'[Usar tar.gz en vez de 7z]' \
+                        '(-k --key-length)'{-k,--key-length}'[Longitud de la clave interna]:longitud:' \
+                        '*'{--exclude,-e}'[Excluir patrón (repetible)]:patrón:' \
+                        '(-r --remove)'{-r,--remove}'[Borrar el original tras cifrar]' \
+                        '(-s --show-keys)'{-s,--show-keys}'[Mostrar clave interna al terminar]' \
+                        '(-v --verbose)'{-v,--verbose}'[Progreso detallado]' \
+                        '--algo[Ignorado (age usa ChaCha20-Poly1305)]:algoritmo:' \
+                        '*:ruta:_files -/'
+                    ;;
+                decrypt|dec|d)
+                    _arguments \
+                        '(-r --remove)'{-r,--remove}'[Borrar .sith y .meta tras descifrar]' \
+                        '(-v --verbose)'{-v,--verbose}'[Progreso detallado]' \
+                        '*:archivo:_files -g "*.sith"'
+                    ;;
+                key|gen|k)
+                    _arguments \
+                        '1:longitud de la clave:'
+                    ;;
+            esac
+            ;;
+    esac
+
+    return ret
+}
